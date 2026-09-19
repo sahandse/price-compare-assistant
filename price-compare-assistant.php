@@ -3,7 +3,7 @@
  * Plugin Name: دستیار مقایسه قیمت
  * Plugin URI: https://github.com/sahandse/price-compare-assistant
  * Description: مقایسه قیمت و اطلاعات محصولات ووکامرس با منابع خارجی و پیشنهاد بروزرسانی قابل تایید توسط مدیر.
- * Version: 1.0.1
+ * Version: 1.1.2
  * Author: Sahand Rezvan
  * Author URI: https://github.com/sahandse
  * Text Domain: price-compare-assistant
@@ -15,7 +15,7 @@
 defined('ABSPATH') || exit;
 
 final class PCA_Plugin {
-    const VERSION = '1.1.1';
+    const VERSION = '1.1.2';
     const OPTION  = 'pca_settings';
 
     public function __construct() {
@@ -93,7 +93,8 @@ final class PCA_Plugin {
     }
 
     public function admin_assets($hook) {
-        if (false === strpos($hook, 'price-compare-assistant')) return;
+        $page = isset($_GET['page']) ? sanitize_key(wp_unslash($_GET['page'])) : '';
+        if ('price-compare-assistant' !== $page && false === strpos($hook, 'price-compare-assistant')) return;
         wp_enqueue_style('pca-admin', plugin_dir_url(__FILE__) . 'assets/admin.css', [], self::VERSION);
     }
 
