@@ -3,7 +3,7 @@
  * Plugin Name: دستیار مقایسه قیمت
  * Plugin URI: https://github.com/sahandse/price-compare-assistant
  * Description: مقایسه قیمت و اطلاعات محصولات ووکامرس با منابع خارجی و پیشنهاد بروزرسانی قابل تایید توسط مدیر.
- * Version: 1.3.0
+ * Version: 1.4.0
  * Author: Sahand Rezvan
  * Author URI: https://github.com/sahandse
  * Text Domain: price-compare-assistant
@@ -15,7 +15,7 @@
 defined('ABSPATH') || exit;
 
 final class PCA_Plugin {
-    const VERSION = '1.3.0';
+    const VERSION = '1.4.0';
     const OPTION  = 'pca_settings';
 
     public function __construct() {
@@ -43,6 +43,8 @@ final class PCA_Plugin {
         add_action('wp_ajax_pca_select_match', [$this, 'ajax_select_match']);
         add_action('wp_ajax_pca_refresh_price', [$this, 'ajax_refresh_price']);
         add_action('wp_ajax_pca_apply_price', [$this, 'ajax_apply_price']);
+        add_action('wp_ajax_pca_fetch_content', [$this, 'ajax_fetch_content']);
+        add_action('wp_ajax_pca_apply_content', [$this, 'ajax_apply_content']);
     }
 
     public function woocommerce_notice() {
@@ -101,6 +103,14 @@ final class PCA_Plugin {
             );
             add_submenu_page(
                 's-store',
+                'محتوا و سئو محصولات',
+                '↳ محتوا و سئو',
+                'manage_woocommerce',
+                'price-compare-assistant-content',
+                [$this, 'content_page']
+            );
+            add_submenu_page(
+                's-store',
                 'تنظیمات دستیار مقایسه قیمت',
                 '↳ تنظیمات',
                 'manage_woocommerce',
@@ -125,6 +135,14 @@ final class PCA_Plugin {
             'manage_woocommerce',
             'price-compare-assistant-products',
             [$this, 'products_page']
+        );
+        add_submenu_page(
+            'woocommerce',
+            'محتوا و سئو محصولات',
+            '↳ محتوا و سئو',
+            'manage_woocommerce',
+            'price-compare-assistant-content',
+            [$this, 'content_page']
         );
         add_submenu_page(
             'woocommerce',
@@ -396,6 +414,105 @@ final class PCA_Plugin {
             'currency' => $store_currency,
             'checked_at' => current_time('timestamp'),
         ];
+    }
+
+    private function extract_content($url, $source) {
+        if (!$this->allowed_source_url($url, $source)) return new WP_Error('pca_url','آدرس منبع معتبر نیست.');
+        $html=$this->remote_html($url);
+        if(is_wp_error($html)) return $html;
+
+        $data=['title'=>'','description'=>'','keywords'=>[]];
+
+        if(preg_match_all('#<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>#is',$html,$matches)){
+            foreach($matches[1] as $json){
+                $j=json_decode(html_entity_decode($json,ENT_QUOTES|ENT_HTML5,'UTF-8'),true);
+                if(!is_array($j)) continue;
+                $stack=isset($j['@graph'])&&is_array($j['@graph'])?$j['@graph']:[$j];
+                foreach($stack as $node){
+                    if(!is_array($node)) continue;
+                    $type=$node['@type']??'';
+                    if(is_array($type)) $type=implode(' ',$type);
+                    if(false!==stripos((string)$type,'Product')){
+                        if(!$data['title']&&!empty($node['name'])) $data['title']=sanitize_text_field(wp_strip_all_tags($node['name']));
+                        if(!$data['description']&&!empty($node['description'])) $data['description']=sanitize_textarea_field(wp_strip_all_tags($node['description']));
+                    }
+                }
+            }
+        }
+
+        if(!$data['title'] && preg_match('#<meta[^>]+property=["\']og:title["\'][^>]+content=["\']([^"\']+)#i',$html,$m)) $data['title']=sanitize_text_field(html_entity_decode($m[1],ENT_QUOTES|ENT_HTML5,'UTF-8'));
+        if(!$data['title'] && preg_match('#<title[^>]*>(.*?)</title>#is',$html,$m)) $data['title']=sanitize_text_field(wp_strip_all_tags(html_entity_decode($m[1],ENT_QUOTES|ENT_HTML5,'UTF-8')));
+
+        if(!$data['description'] && preg_match('#<meta[^>]+name=["\']description["\'][^>]+content=["\']([^"\']*)#i',$html,$m)) $data['description']=sanitize_textarea_field(html_entity_decode($m[1],ENT_QUOTES|ENT_HTML5,'UTF-8'));
+        if(!$data['description'] && preg_match('#<meta[^>]+property=["\']og:description["\'][^>]+content=["\']([^"\']*)#i',$html,$m)) $data['description']=sanitize_textarea_field(html_entity_decode($m[1],ENT_QUOTES|ENT_HTML5,'UTF-8'));
+
+        if(preg_match('#<meta[^>]+name=["\']keywords["\'][^>]+content=["\']([^"\']*)#i',$html,$m)){
+            $data['keywords']=array_values(array_filter(array_map('sanitize_text_field',preg_split('/[,،]+/u',$m[1]))));
+        }
+
+        $data['title']=mb_substr($data['title'],0,250,'UTF-8');
+        $data['description']=mb_substr($data['description'],0,1500,'UTF-8');
+        $data['keywords']=array_slice($data['keywords'],0,20);
+        return $data;
+    }
+
+    public function ajax_fetch_content() {
+        $this->require_ajax_access();
+        $product_id=absint($_POST['product_id']??0);
+        $source=sanitize_key($_POST['source']??'');
+        $product=wc_get_product($product_id);
+        $match=(array)get_post_meta($product_id,'_pca_match_'.$source,true);
+        if(!$product||empty($match['url'])) wp_send_json_error(['message'=>'ابتدا محصول متناظر را در این منبع پیدا کنید.']);
+
+        $data=$this->extract_content($match['url'],$source);
+        if(is_wp_error($data)) wp_send_json_error(['message'=>$data->get_error_message()]);
+        update_post_meta($product_id,'_pca_content_'.$source,$data);
+        wp_send_json_success([
+            'source'=>$source,
+            'source_title'=>$match['title']??'',
+            'url'=>$match['url'],
+            'content'=>$data,
+        ]);
+    }
+
+    public function ajax_apply_content() {
+        $this->require_ajax_access();
+        $product_id=absint($_POST['product_id']??0);
+        $source=sanitize_key($_POST['source']??'');
+        $replace=!empty($_POST['replace']);
+        $data=(array)get_post_meta($product_id,'_pca_content_'.$source,true);
+        $product=wc_get_product($product_id);
+        if(!$product||!$data) wp_send_json_error(['message'=>'ابتدا اطلاعات منبع را دریافت کنید.']);
+
+        $post=get_post($product_id);
+        $changes=[];
+
+        if(!empty($data['title']) && ($replace || !$product->get_name())){
+            wp_update_post(['ID'=>$product_id,'post_title'=>sanitize_text_field($data['title'])]);
+            $changes[]='عنوان';
+        }
+
+        if(!empty($data['description']) && ($replace || !trim((string)$post->post_excerpt))){
+            wp_update_post(['ID'=>$product_id,'post_excerpt'=>wp_kses_post($data['description'])]);
+            $changes[]='توضیح کوتاه';
+        }
+
+        $seo_desc=(string)get_post_meta($product_id,'_yoast_wpseo_metadesc',true);
+        if(!empty($data['description']) && ($replace || !$seo_desc)){
+            update_post_meta($product_id,'_yoast_wpseo_metadesc',mb_substr(wp_strip_all_tags($data['description']),0,160,'UTF-8'));
+            $changes[]='Meta Description';
+        }
+
+        if(!empty($data['keywords'])){
+            $terms=array_values(array_filter(array_map('sanitize_text_field',$data['keywords'])));
+            if($terms){
+                if($replace) wp_set_post_terms($product_id,$terms,'product_tag',false);
+                else wp_set_post_terms($product_id,$terms,'product_tag',true);
+                $changes[]='برچسب‌ها';
+            }
+        }
+
+        wp_send_json_success(['message'=>$changes?'بروزرسانی شد: '.implode('، ',$changes):'مورد خالی برای تکمیل وجود نداشت.','changes'=>$changes]);
     }
 
     private function require_ajax_access() {
@@ -689,6 +806,35 @@ final class PCA_Plugin {
         <?php
     }
 
+    public function content_page() {
+        if(!current_user_can('manage_woocommerce')) return;
+        $paged=max(1,absint($_GET['paged']??1));
+        $search=sanitize_text_field(wp_unslash($_GET['s']??''));
+        $args=['post_type'=>'product','post_status'=>['publish','draft','private'],'posts_per_page'=>12,'paged'=>$paged,'orderby'=>'modified','order'=>'DESC','fields'=>'ids'];
+        if($search) $args['s']=$search;
+        $query=new WP_Query($args);
+        ?>
+        <div class="wrap pca-admin pca-content-page">
+          <div class="pca-page-hero"><div><span class="pca-eyebrow">CONTENT ASSISTANT</span><h1>محتوا و سئو محصولات</h1><p>از محصول تطبیق‌شده در دیجی‌کالا، ترب یا باسلام عنوان، توضیح و کلیدواژه‌ها را بخوانید؛ اعمال تغییر فقط با تأیید شما انجام می‌شود.</p></div></div>
+          <form class="pca-products-toolbar" method="get"><input type="hidden" name="page" value="price-compare-assistant-content"><label class="pca-searchbox"><span>⌕</span><input type="search" name="s" value="<?php echo esc_attr($search); ?>" placeholder="جستجوی محصول…"></label><button class="button button-primary">جستجو</button></form>
+          <div class="pca-content-list">
+          <?php foreach($query->posts as $product_id): $product=wc_get_product($product_id); if(!$product)continue; ?>
+            <article class="pca-content-card" data-product="<?php echo esc_attr($product_id); ?>">
+              <header><div><small>#<?php echo esc_html($product_id); ?></small><h2><?php echo esc_html($product->get_name()); ?></h2></div><span><?php echo esc_html($product->get_sku()?:'بدون SKU'); ?></span></header>
+              <div class="pca-content-sources">
+                <?php foreach(['digikala'=>'دیجی‌کالا','torob'=>'ترب','basalam'=>'باسلام'] as $source=>$label): $match=(array)get_post_meta($product_id,'_pca_match_'.$source,true); ?>
+                  <button type="button" class="pca-content-source <?php echo empty($match['url'])?'is-disabled':''; ?>" data-source="<?php echo esc_attr($source); ?>" <?php disabled(empty($match['url'])); ?>><?php echo esc_html($label); ?><small><?php echo empty($match['url'])?'ابتدا تطبیق قیمت':'دریافت محتوا'; ?></small></button>
+                <?php endforeach; ?>
+              </div>
+              <div class="pca-content-preview"><p>یک منبع را انتخاب کنید.</p></div>
+              <footer class="pca-content-actions" hidden><button type="button" class="button button-primary pca-content-apply" data-replace="0">پر کردن موارد خالی</button><button type="button" class="button pca-content-apply" data-replace="1">جایگزینی اطلاعات</button></footer>
+            </article>
+          <?php endforeach; ?>
+          </div>
+        </div>
+        <?php
+    }
+
     public function settings_page() {
         if (!current_user_can('manage_woocommerce')) return;
         $s = $this->settings();
@@ -751,7 +897,7 @@ final class PCA_Plugin {
 
                     <section class="pca-card">
                         <h2>وضعیت توسعه</h2>
-                        <p>هسته تنظیمات و رابط مدیریت آماده است. موتور جستجو، استخراج قیمت/محتوا و دکمه اعمال مستقیم در نسخه‌های بعدی همین Repo تکمیل می‌شود.</p>
+                        <p>مقایسه قیمت و دستیار محتوا فعال است. تغییر قیمت یا محتوای محصول فقط با تأیید مدیر انجام می‌شود.</p>
                     </section>
                 </div>
 
