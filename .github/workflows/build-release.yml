@@ -1,10 +1,15 @@
-name: Build Plugin ZIP
+name: Build Price Compare Assistant ZIP
 
 on:
   push:
-    tags:
-      - 'v*'
-  workflow_dispatch:
+    branches:
+      - main
+    paths:
+      - 'price-compare-assistant.php'
+      - 'assets/**'
+      - 'README.md'
+      - 'readme.txt'
+      - '.github/workflows/build-release.yml'
 
 permissions:
   contents: write
@@ -12,30 +17,46 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Prepare plugin
+      - name: Read version
+        id: version
+        shell: bash
         run: |
-          mkdir -p build/price-compare-assistant
-          rsync -av --exclude='.git' --exclude='.github' --exclude='build' ./ build/price-compare-assistant/
+          VERSION=$(grep 'Version:' price-compare-assistant.php | head -1 | sed 's/.*Version:[[:space:]]*//')
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
-      - name: Create ZIP
+      - name: PHP syntax check
+        run: php -l price-compare-assistant.php
+
+      - name: Build ZIP
+        shell: bash
         run: |
+          rm -rf dist build
+          mkdir -p dist build/price-compare-assistant
+          cp price-compare-assistant.php build/price-compare-assistant/
+          [ -f README.md ] && cp README.md build/price-compare-assistant/ || true
+          [ -f readme.txt ] && cp readme.txt build/price-compare-assistant/ || true
+          [ -d assets ] && cp -R assets build/price-compare-assistant/ || true
           cd build
-          zip -r price-compare-assistant.zip price-compare-assistant
+          zip -qr ../dist/price-compare-assistant.zip price-compare-assistant
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: price-compare-assistant
-          path: build/price-compare-assistant.zip
+          name: price-compare-assistant-v${{ steps.version.outputs.version }}
+          path: dist/price-compare-assistant.zip
 
-      - name: Publish GitHub Release
-        if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
-        with:
-          files: build/price-compare-assistant.zip
-          generate_release_notes: true
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        shell: bash
+        run: |
+          TAG="price-compare-assistant-v${VERSION}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/price-compare-assistant.zip --clobber
+          else
+            gh release create "$TAG" dist/price-compare-assistant.zip --title "Price Compare Assistant v${VERSION}" --notes "Installable WordPress ZIP for Price Compare Assistant v${VERSION}."
+          fi
