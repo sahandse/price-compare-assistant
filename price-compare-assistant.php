@@ -15,7 +15,7 @@
 defined('ABSPATH') || exit;
 
 final class PCA_Plugin {
-    const VERSION = '1.0.1';
+    const VERSION = '1.1.1';
     const OPTION  = 'pca_settings';
 
     public function __construct() {
