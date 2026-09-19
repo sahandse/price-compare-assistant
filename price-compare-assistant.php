@@ -3,7 +3,7 @@
  * Plugin Name: دستیار مقایسه قیمت
  * Plugin URI: https://github.com/sahandse/price-compare-assistant
  * Description: مقایسه قیمت و اطلاعات محصولات ووکامرس با منابع خارجی و پیشنهاد بروزرسانی قابل تایید توسط مدیر.
- * Version: 1.2.0
+ * Version: 1.3.0
  * Author: Sahand Rezvan
  * Author URI: https://github.com/sahandse
  * Text Domain: price-compare-assistant
@@ -15,7 +15,7 @@
 defined('ABSPATH') || exit;
 
 final class PCA_Plugin {
-    const VERSION = '1.2.0';
+    const VERSION = '1.3.0';
     const OPTION  = 'pca_settings';
 
     public function __construct() {
@@ -181,9 +181,56 @@ final class PCA_Plugin {
     }
 
     private function product_query_text($product) {
-        $parts = [$product->get_name()];
-        if ($product->get_sku()) $parts[] = $product->get_sku();
-        return trim(implode(' ', array_filter($parts)));
+        return trim((string) $product->get_name());
+    }
+
+    private function normalize_title($value) {
+        $value = html_entity_decode((string) $value, ENT_QUOTES | ENT_HTML5, 'UTF-8');
+        $value = strtr($value, [
+            'ي' => 'ی', 'ى' => 'ی', 'ك' => 'ک', 'ۀ' => 'ه', 'ة' => 'ه',
+            '‌' => ' ', '-' => ' ', '_' => ' ', '/' => ' ', '\\' => ' ',
+        ]);
+        $value = mb_strtolower($value, 'UTF-8');
+        $value = preg_replace('/[^\p{L}\p{N}\s]+/u', ' ', $value);
+        $value = preg_replace('/\s+/u', ' ', trim($value));
+
+        $stop = ['خرید','قیمت','فروش','اصل','اورجینال','جدید','مدل','محصول','کالا','آنلاین','تومان','ریال'];
+        $tokens = preg_split('/\s+/u', $value, -1, PREG_SPLIT_NO_EMPTY);
+        $tokens = array_values(array_filter($tokens, function($token) use ($stop) {
+            return mb_strlen($token, 'UTF-8') > 1 && !in_array($token, $stop, true);
+        }));
+        return implode(' ', $tokens);
+    }
+
+    private function title_similarity($needle, $candidate) {
+        $a = $this->normalize_title($needle);
+        $b = $this->normalize_title($candidate);
+        if (!$a || !$b) return 0;
+
+        if ($a === $b) return 100;
+
+        $aTokens = array_values(array_unique(preg_split('/\s+/u', $a, -1, PREG_SPLIT_NO_EMPTY)));
+        $bTokens = array_values(array_unique(preg_split('/\s+/u', $b, -1, PREG_SPLIT_NO_EMPTY)));
+
+        $intersection = count(array_intersect($aTokens, $bTokens));
+        $union = count(array_unique(array_merge($aTokens, $bTokens)));
+        $tokenScore = $union ? ($intersection / $union) * 100 : 0;
+
+        $containScore = 0;
+        if (false !== mb_strpos($b, $a, 0, 'UTF-8') || false !== mb_strpos($a, $b, 0, 'UTF-8')) {
+            $containScore = 92;
+        }
+
+        $aAscii = preg_replace('/\s+/u', '', $a);
+        $bAscii = preg_replace('/\s+/u', '', $b);
+        $maxLen = max(mb_strlen($aAscii, 'UTF-8'), mb_strlen($bAscii, 'UTF-8'));
+        $levScore = 0;
+        if ($maxLen && function_exists('levenshtein') && preg_match('/^[\x00-\x7F]+$/', $aAscii . $bAscii)) {
+            $distance = levenshtein($aAscii, $bAscii);
+            $levScore = max(0, (1 - ($distance / max(1, $maxLen))) * 100);
+        }
+
+        return (int) round(max($containScore, ($tokenScore * 0.82) + ($levScore * 0.18)));
     }
 
     private function allowed_source_url($url, $source) {
@@ -238,6 +285,7 @@ final class PCA_Plugin {
             libxml_use_internal_errors(true);
             @$dom->loadHTML('<?xml encoding="utf-8" ?>' . $html);
             libxml_clear_errors();
+
             foreach ($dom->getElementsByTagName('a') as $a) {
                 $href = $this->absolute_url(trim((string)$a->getAttribute('href')), $search_url);
                 if (!$href || !$this->allowed_source_url($href, $source)) continue;
@@ -253,23 +301,32 @@ final class PCA_Plugin {
                 if (!$matched) continue;
 
                 $title = trim(preg_replace('/\s+/u', ' ', wp_strip_all_tags($a->textContent)));
-                if (mb_strlen($title) < 4) continue;
+                if (mb_strlen($title, 'UTF-8') < 4) continue;
 
                 $key = untrailingslashit($href);
                 if (isset($results[$key])) continue;
+
                 $results[$key] = [
-                    'title' => mb_substr($title, 0, 180),
+                    'title' => mb_substr($title, 0, 180, 'UTF-8'),
                     'url' => $key,
+                    'score' => $this->title_similarity($query, $title),
                 ];
-                if (count($results) >= 5) break;
+
+                if (count($results) >= 18) break;
             }
         }
+
+        $results = array_values($results);
+        usort($results, function($a, $b) {
+            return ($b['score'] ?? 0) <=> ($a['score'] ?? 0);
+        });
+        $results = array_slice($results, 0, 6);
 
         return [
             'source' => $source,
             'label' => $cfg['label'],
             'search_url' => $search_url,
-            'results' => array_values($results),
+            'results' => $results,
         ];
     }
 
@@ -358,10 +415,42 @@ final class PCA_Plugin {
             wp_send_json_error(['message' => 'محصول یا منبع معتبر نیست.']);
         }
 
-        $result = $this->search_source($source, $this->product_query_text($product));
+        $query = $this->product_query_text($product);
+        $result = $this->search_source($source, $query);
         if (is_wp_error($result)) {
             wp_send_json_error(['message' => $result->get_error_message()]);
         }
+
+        $best = !empty($result['results'][0]) ? $result['results'][0] : null;
+        if ($best && (int)($best['score'] ?? 0) >= 34) {
+            update_post_meta($product_id, '_pca_match_' . $source, [
+                'url' => $best['url'],
+                'title' => $best['title'],
+                'score' => (int)$best['score'],
+            ]);
+
+            $price = $this->extract_price($best['url'], $source);
+            if (!is_wp_error($price)) {
+                update_post_meta($product_id, '_pca_price_' . $source, $price);
+                $result['auto_match'] = [
+                    'title' => $best['title'],
+                    'url' => $best['url'],
+                    'score' => (int)$best['score'],
+                    'price' => $price['price'],
+                    'formatted' => wp_strip_all_tags(wc_price($price['price'])),
+                    'checked_at' => wp_date('Y/m/d H:i', $price['checked_at']),
+                ];
+            } else {
+                $result['auto_match'] = [
+                    'title' => $best['title'],
+                    'url' => $best['url'],
+                    'score' => (int)$best['score'],
+                    'price' => null,
+                    'message' => $price->get_error_message(),
+                ];
+            }
+        }
+
         wp_send_json_success($result);
     }
 
@@ -453,32 +542,38 @@ final class PCA_Plugin {
         $cfg = $this->source_config($source);
         $match = (array) get_post_meta($product_id, '_pca_match_' . $source, true);
         $price = (array) get_post_meta($product_id, '_pca_price_' . $source, true);
+        $score = isset($match['score']) ? (int)$match['score'] : 0;
 
         ob_start();
         ?>
-        <div class="pca-source" data-source="<?php echo esc_attr($source); ?>">
-            <div class="pca-source-head">
-                <strong><?php echo esc_html($cfg['label']); ?></strong>
-                <button type="button" class="button-link pca-search-source">جستجو</button>
+        <section class="pca-market pca-market-<?php echo esc_attr($source); ?>" data-source="<?php echo esc_attr($source); ?>">
+            <div class="pca-market-top">
+                <div class="pca-market-brand">
+                    <span class="pca-market-dot"></span>
+                    <div><strong><?php echo esc_html($cfg['label']); ?></strong><small><?php echo $score ? esc_html($score . '٪ تطبیق') : 'جستجوی هوشمند نام'; ?></small></div>
+                </div>
+                <button type="button" class="pca-icon-btn pca-search-source" title="جستجوی دوباره">↻</button>
             </div>
+
             <div class="pca-source-price">
                 <?php if (!empty($price['price'])): ?>
                     <b><?php echo wp_kses_post(wc_price((float)$price['price'])); ?></b>
-                    <small><?php echo !empty($price['checked_at']) ? esc_html(wp_date('Y/m/d H:i', (int)$price['checked_at'])) : ''; ?></small>
+                    <small><?php echo !empty($price['checked_at']) ? 'بروزرسانی ' . esc_html(wp_date('Y/m/d H:i', (int)$price['checked_at'])) : ''; ?></small>
                 <?php else: ?>
-                    <b>—</b><small>قیمت دریافت نشده</small>
+                    <b class="pca-price-empty">—</b><small>برای دریافت قیمت جستجو کنید</small>
                 <?php endif; ?>
             </div>
+
             <div class="pca-source-match">
                 <?php if (!empty($match['url'])): ?>
                     <a href="<?php echo esc_url($match['url']); ?>" target="_blank" rel="noopener"><?php echo esc_html($match['title'] ?: 'محصول انتخاب‌شده'); ?></a>
-                    <button type="button" class="button-link pca-refresh-source">بروزرسانی قیمت</button>
+                    <button type="button" class="pca-text-btn pca-refresh-source">بروزرسانی قیمت</button>
                 <?php else: ?>
-                    <span>هنوز تطبیق داده نشده</span>
+                    <span>هنوز محصول مشابه پیدا نشده</span>
                 <?php endif; ?>
             </div>
             <div class="pca-suggestions" hidden></div>
-        </div>
+        </section>
         <?php
         return ob_get_clean();
     }
@@ -491,7 +586,7 @@ final class PCA_Plugin {
         $args = [
             'post_type' => 'product',
             'post_status' => ['publish', 'draft', 'private'],
-            'posts_per_page' => 20,
+            'posts_per_page' => 12,
             'paged' => $paged,
             'orderby' => 'modified',
             'order' => 'DESC',
@@ -502,57 +597,79 @@ final class PCA_Plugin {
         $query = new WP_Query($args);
         ?>
         <div class="wrap pca-admin pca-products-page">
-            <div class="pca-hero">
+            <section class="pca-page-hero">
                 <div>
+                    <span class="pca-eyebrow">PRICE INTELLIGENCE</span>
                     <h1>محصولات و مقایسه قیمت</h1>
-                    <p>قیمت فروشگاه را کنار دیجی‌کالا، ترب و باسلام ببینید؛ تغییر قیمت فقط با تایید شما انجام می‌شود.</p>
+                    <p>قیمت فروشگاه را کنار نزدیک‌ترین نتیجه دیجی‌کالا، ترب و باسلام ببینید. اولین نتیجه مشابه نام محصول، خودکار انتخاب و قیمتش نمایش داده می‌شود.</p>
                 </div>
-                <span>v<?php echo esc_html(self::VERSION); ?></span>
-            </div>
-
-            <form class="pca-products-toolbar" method="get">
-                <input type="hidden" name="page" value="price-compare-assistant-products">
-                <input type="search" name="s" value="<?php echo esc_attr($search); ?>" placeholder="جستجو با نام محصول یا SKU…">
-                <button class="button button-primary">جستجو</button>
-                <a class="button" href="<?php echo esc_url(admin_url('admin.php?page=price-compare-assistant-products')); ?>">پاک‌کردن</a>
-            </form>
-
-            <div class="pca-products-table">
-                <div class="pca-products-head">
-                    <span>محصول</span><span>قیمت سایت</span><span>دیجی‌کالا</span><span>ترب</span><span>باسلام</span><span>قیمت جدید</span>
+                <div class="pca-hero-stats">
+                    <span><b><?php echo esc_html($query->found_posts); ?></b><small>محصول</small></span>
+                    <span><b>3</b><small>منبع قیمت</small></span>
                 </div>
+            </section>
 
+            <section class="pca-controlbar">
+                <form class="pca-products-toolbar" method="get">
+                    <input type="hidden" name="page" value="price-compare-assistant-products">
+                    <label class="pca-searchbox">
+                        <span>⌕</span>
+                        <input type="search" name="s" value="<?php echo esc_attr($search); ?>" placeholder="نام محصول یا SKU را جستجو کنید…">
+                    </label>
+                    <button class="button button-primary">جستجو</button>
+                    <?php if ($search): ?><a class="button" href="<?php echo esc_url(admin_url('admin.php?page=price-compare-assistant-products')); ?>">حذف فیلتر</a><?php endif; ?>
+                </form>
+                <div class="pca-control-help">تغییر قیمت فروشگاه فقط با تایید شما انجام می‌شود.</div>
+            </section>
+
+            <div class="pca-product-list">
                 <?php foreach ($query->posts as $product_id):
                     $product = wc_get_product($product_id);
                     if (!$product) continue;
-                    $image = wp_get_attachment_image_url($product->get_image_id(), 'thumbnail');
+                    $image = wp_get_attachment_image_url($product->get_image_id(), 'medium');
                     ?>
-                    <article class="pca-product-row" data-product="<?php echo esc_attr($product_id); ?>">
-                        <div class="pca-product-main">
-                            <?php if ($image): ?><img src="<?php echo esc_url($image); ?>" alt=""><?php else: ?><span class="pca-product-placeholder">⌑</span><?php endif; ?>
-                            <div>
-                                <strong><?php echo esc_html($product->get_name()); ?></strong>
-                                <small>SKU: <?php echo esc_html($product->get_sku() ?: '—'); ?> · #<?php echo esc_html($product_id); ?></small>
-                                <button type="button" class="button-link pca-search-all">جستجوی خودکار در هر ۳ سایت</button>
+                    <article class="pca-product-card" data-product="<?php echo esc_attr($product_id); ?>">
+                        <header class="pca-product-header">
+                            <div class="pca-product-identity">
+                                <?php if ($image): ?><img src="<?php echo esc_url($image); ?>" alt=""><?php else: ?><span class="pca-product-placeholder">◫</span><?php endif; ?>
+                                <div>
+                                    <div class="pca-product-flags">
+                                        <span>#<?php echo esc_html($product_id); ?></span>
+                                        <?php if ($product->get_sku()): ?><span>SKU: <?php echo esc_html($product->get_sku()); ?></span><?php endif; ?>
+                                    </div>
+                                    <h2><?php echo esc_html($product->get_name()); ?></h2>
+                                    <button type="button" class="pca-primary-action pca-search-all"><span>⌕</span>مقایسه خودکار در هر ۳ سایت</button>
+                                </div>
                             </div>
+
+                            <div class="pca-store-price">
+                                <small>قیمت فروشگاه شما</small>
+                                <strong><?php echo wp_kses_post($product->get_price_html() ?: '—'); ?></strong>
+                                <a href="<?php echo esc_url(get_edit_post_link($product_id)); ?>">ویرایش محصول</a>
+                            </div>
+                        </header>
+
+                        <div class="pca-market-grid">
+                            <?php echo $this->source_cell($product_id, 'digikala'); ?>
+                            <?php echo $this->source_cell($product_id, 'torob'); ?>
+                            <?php echo $this->source_cell($product_id, 'basalam'); ?>
                         </div>
-                        <div class="pca-own-price">
-                            <b><?php echo wp_kses_post($product->get_price_html() ?: '—'); ?></b>
-                            <small>قیمت فعلی فروشگاه</small>
-                        </div>
-                        <?php echo $this->source_cell($product_id, 'digikala'); ?>
-                        <?php echo $this->source_cell($product_id, 'torob'); ?>
-                        <?php echo $this->source_cell($product_id, 'basalam'); ?>
-                        <div class="pca-apply-price">
-                            <input type="number" min="0" step="1" placeholder="قیمت جدید">
-                            <button type="button" class="button button-primary pca-apply-price-btn">اعمال قیمت</button>
-                            <small>فقط با کلیک شما تغییر می‌کند</small>
-                        </div>
+
+                        <footer class="pca-product-footer">
+                            <div>
+                                <strong>قیمت فروشگاه را تغییر می‌دهید؟</strong>
+                                <span>می‌توانید یکی از قیمت‌های پیدا شده را وارد کنید یا مبلغ دلخواه بنویسید.</span>
+                            </div>
+                            <div class="pca-apply-price">
+                                <input type="number" min="0" step="1" placeholder="قیمت جدید">
+                                <button type="button" class="button button-primary pca-apply-price-btn">اعمال قیمت</button>
+                            </div>
+                        </footer>
                     </article>
                 <?php endforeach; ?>
 
                 <?php if (!$query->posts): ?>
-                    <div class="pca-empty">محصولی پیدا نشد.</div>
+                    <div class="pca-empty">محصولی با این جستجو پیدا نشد.</div>
                 <?php endif; ?>
             </div>
 
