@@ -9,7 +9,11 @@ document.addEventListener('DOMContentLoaded', () => {
       headers: { 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8' },
       body
     });
-    return res.json();
+    let payload;
+    try { payload = await res.json(); }
+    catch (e) { throw new Error(PCAAdmin.labels.error); }
+    if (!payload.success) throw new Error(payload?.data?.message || PCAAdmin.labels.error);
+    return payload.data;
   };
 
   const escapeHtml = value => String(value || '').replace(/[&<>"']/g, ch => ({
@@ -19,80 +23,128 @@ document.addEventListener('DOMContentLoaded', () => {
   const setBusy = (el, busy, text) => {
     if (!el) return;
     if (busy) {
-      el.dataset.oldText = el.textContent;
+      if (!el.dataset.oldHtml) el.dataset.oldHtml = el.innerHTML;
       el.disabled = true;
-      el.textContent = text || PCAAdmin.labels.loading;
+      el.classList.add('is-loading');
+      el.innerHTML = '<span class="pca-spinner"></span>' + escapeHtml(text || PCAAdmin.labels.loading);
     } else {
       el.disabled = false;
-      el.textContent = el.dataset.oldText || el.textContent;
+      el.classList.remove('is-loading');
+      el.innerHTML = el.dataset.oldHtml || el.innerHTML;
     }
   };
 
-  const renderSuggestions = (sourceBox, payload) => {
-    const box = sourceBox.querySelector('.pca-suggestions');
-    const source = sourceBox.dataset.source;
-    const productId = sourceBox.closest('.pca-product-row').dataset.product;
+  const updateMarket = (market, data) => {
+    const price = market.querySelector('.pca-source-price');
+    const match = market.querySelector('.pca-source-match');
+    const brandSmall = market.querySelector('.pca-market-brand small');
+
+    if (brandSmall && data.score) brandSmall.textContent = data.score + '٪ تطبیق';
+
+    if (data.formatted) {
+      price.innerHTML =
+        '<b>' + escapeHtml(data.formatted) + '</b>' +
+        '<small>' + escapeHtml(data.checked_at ? 'بروزرسانی ' + data.checked_at : 'قیمت پیدا شد') + '</small>';
+      market.classList.add('has-price');
+      market.classList.remove('has-error');
+    } else {
+      price.innerHTML =
+        '<b class="pca-price-empty">—</b>' +
+        '<small>' + escapeHtml(data.message || 'قیمت از صفحه قابل استخراج نبود') + '</small>';
+      market.classList.add('has-error');
+    }
+
+    if (data.url) {
+      match.innerHTML =
+        '<a href="' + escapeHtml(data.url) + '" target="_blank" rel="noopener">' +
+          escapeHtml(data.title || 'محصول پیدا شده') +
+        '</a>' +
+        '<button type="button" class="pca-text-btn pca-refresh-source">بروزرسانی قیمت</button>';
+    }
+  };
+
+  const renderSuggestions = (market, payload) => {
+    const box = market.querySelector('.pca-suggestions');
+    const source = market.dataset.source;
+    const productId = market.closest('.pca-product-card').dataset.product;
 
     if (!payload.results || !payload.results.length) {
       box.innerHTML =
         '<div class="pca-suggest-empty">' +
           escapeHtml(PCAAdmin.labels.notFound) +
-          ' <a href="' + escapeHtml(payload.search_url) + '" target="_blank" rel="noopener">نمایش جستجو در سایت</a>' +
+          ' <a href="' + escapeHtml(payload.search_url) + '" target="_blank" rel="noopener">جستجو در سایت منبع</a>' +
         '</div>';
       box.hidden = false;
       return;
     }
 
-    box.innerHTML = payload.results.map(item => (
+    box.innerHTML = payload.results.map((item, index) => (
       '<button type="button" class="pca-suggest-item" ' +
         'data-product="' + escapeHtml(productId) + '" ' +
         'data-source="' + escapeHtml(source) + '" ' +
         'data-url="' + escapeHtml(item.url) + '" ' +
         'data-title="' + escapeHtml(item.title) + '">' +
-          '<strong>' + escapeHtml(item.title) + '</strong>' +
-          '<small>' + escapeHtml(item.url) + '</small>' +
-          '<span>انتخاب این محصول</span>' +
+          '<span class="pca-suggest-rank">' + (index + 1) + '</span>' +
+          '<span class="pca-suggest-copy">' +
+            '<strong>' + escapeHtml(item.title) + '</strong>' +
+            '<small>' + escapeHtml((item.score || 0) + '٪ شباهت') + '</small>' +
+          '</span>' +
+          '<span class="pca-suggest-select">انتخاب</span>' +
       '</button>'
     )).join('');
     box.hidden = false;
   };
 
-  const searchSource = async (sourceBox) => {
-    const row = sourceBox.closest('.pca-product-row');
-    const button = sourceBox.querySelector('.pca-search-source');
-    setBusy(button, true, PCAAdmin.labels.searching);
+  const searchMarket = async (market) => {
+    const row = market.closest('.pca-product-card');
+    const button = market.querySelector('.pca-search-source');
+
+    market.classList.add('is-searching');
+    setBusy(button, true, 'در حال جستجو');
+
     try {
-      const result = await ajax('pca_search_product', {
+      const data = await ajax('pca_search_product', {
         product_id: row.dataset.product,
-        source: sourceBox.dataset.source
+        source: market.dataset.source
       });
-      if (!result.success) throw new Error(result.data?.message || PCAAdmin.labels.error);
-      renderSuggestions(sourceBox, result.data);
+
+      if (data.auto_match) {
+        updateMarket(market, data.auto_match);
+        const suggestions = market.querySelector('.pca-suggestions');
+        suggestions.hidden = true;
+      } else {
+        renderSuggestions(market, data);
+      }
     } catch (err) {
-      const box = sourceBox.querySelector('.pca-suggestions');
+      market.classList.add('has-error');
+      const box = market.querySelector('.pca-suggestions');
       box.innerHTML = '<div class="pca-suggest-error">' + escapeHtml(err.message) + '</div>';
       box.hidden = false;
     } finally {
+      market.classList.remove('is-searching');
       setBusy(button, false);
     }
   };
 
-  document.addEventListener('click', async (e) => {
+  document.addEventListener('click', async e => {
     const searchOne = e.target.closest('.pca-search-source');
     if (searchOne) {
       e.preventDefault();
-      await searchSource(searchOne.closest('.pca-source'));
+      await searchMarket(searchOne.closest('.pca-market'));
       return;
     }
 
     const searchAll = e.target.closest('.pca-search-all');
     if (searchAll) {
       e.preventDefault();
-      const row = searchAll.closest('.pca-product-row');
-      setBusy(searchAll, true, PCAAdmin.labels.searching);
+      const row = searchAll.closest('.pca-product-card');
+      setBusy(searchAll, true, 'در حال مقایسه');
+      row.classList.add('is-comparing');
+
       try {
-        await Promise.all([...row.querySelectorAll('.pca-source')].map(searchSource));
+        await Promise.all([...row.querySelectorAll('.pca-market')].map(searchMarket));
       } finally {
+        row.classList.remove('is-comparing');
         setBusy(searchAll, false);
       }
       return;
@@ -101,30 +153,23 @@ document.addEventListener('DOMContentLoaded', () => {
     const suggestion = e.target.closest('.pca-suggest-item');
     if (suggestion) {
       e.preventDefault();
-      const sourceBox = suggestion.closest('.pca-source');
+      const market = suggestion.closest('.pca-market');
       suggestion.disabled = true;
+
       try {
-        const result = await ajax('pca_select_match', {
+        const data = await ajax('pca_select_match', {
           product_id: suggestion.dataset.product,
           source: suggestion.dataset.source,
           url: suggestion.dataset.url,
           title: suggestion.dataset.title
         });
-        if (!result.success) throw new Error(result.data?.message || PCAAdmin.labels.error);
 
-        const match = sourceBox.querySelector('.pca-source-match');
-        const price = sourceBox.querySelector('.pca-source-price');
-        match.innerHTML =
-          '<a href="' + escapeHtml(suggestion.dataset.url) + '" target="_blank" rel="noopener">' +
-          escapeHtml(suggestion.dataset.title) + '</a>' +
-          '<button type="button" class="button-link pca-refresh-source">بروزرسانی قیمت</button>';
-
-        if (result.data.formatted) {
-          price.innerHTML = '<b>' + escapeHtml(result.data.formatted) + '</b><small>' + escapeHtml(result.data.checked_at || '') + '</small>';
-        } else {
-          price.innerHTML = '<b>—</b><small>' + escapeHtml(result.data.message || 'محصول تطبیق داده شد؛ قیمت قابل استخراج نبود.') + '</small>';
-        }
-        sourceBox.querySelector('.pca-suggestions').hidden = true;
+        updateMarket(market, {
+          ...data,
+          url: suggestion.dataset.url,
+          title: suggestion.dataset.title
+        });
+        market.querySelector('.pca-suggestions').hidden = true;
       } catch (err) {
         alert(err.message);
       } finally {
@@ -136,17 +181,22 @@ document.addEventListener('DOMContentLoaded', () => {
     const refresh = e.target.closest('.pca-refresh-source');
     if (refresh) {
       e.preventDefault();
-      const sourceBox = refresh.closest('.pca-source');
-      const row = sourceBox.closest('.pca-product-row');
-      setBusy(refresh, true, PCAAdmin.labels.loading);
+      const market = refresh.closest('.pca-market');
+      const row = market.closest('.pca-product-card');
+
+      setBusy(refresh, true, 'در حال بروزرسانی');
       try {
-        const result = await ajax('pca_refresh_price', {
+        const data = await ajax('pca_refresh_price', {
           product_id: row.dataset.product,
-          source: sourceBox.dataset.source
+          source: market.dataset.source
         });
-        if (!result.success) throw new Error(result.data?.message || PCAAdmin.labels.error);
-        sourceBox.querySelector('.pca-source-price').innerHTML =
-          '<b>' + escapeHtml(result.data.formatted) + '</b><small>' + escapeHtml(result.data.checked_at || '') + '</small>';
+
+        const currentLink = market.querySelector('.pca-source-match a');
+        updateMarket(market, {
+          ...data,
+          url: currentLink?.href || '',
+          title: currentLink?.textContent || ''
+        });
       } catch (err) {
         alert(err.message);
       } finally {
@@ -158,27 +208,33 @@ document.addEventListener('DOMContentLoaded', () => {
     const apply = e.target.closest('.pca-apply-price-btn');
     if (apply) {
       e.preventDefault();
-      const row = apply.closest('.pca-product-row');
+      const row = apply.closest('.pca-product-card');
       const input = row.querySelector('.pca-apply-price input');
       const value = input.value.trim();
+
       if (!value) {
-        alert('قیمت جدید را وارد کنید.');
+        input.focus();
         return;
       }
       if (!confirm('قیمت این محصول در ووکامرس تغییر کند؟')) return;
 
-      setBusy(apply, true, 'در حال اعمال…');
+      setBusy(apply, true, 'در حال ذخیره');
       try {
-        const result = await ajax('pca_apply_price', {
+        const data = await ajax('pca_apply_price', {
           product_id: row.dataset.product,
           price: value
         });
-        if (!result.success) throw new Error(result.data?.message || PCAAdmin.labels.error);
 
-        row.querySelector('.pca-own-price').innerHTML =
-          '<b>' + escapeHtml(result.data.formatted) + '</b><small>قیمت فعلی فروشگاه</small>';
+        const price = row.querySelector('.pca-store-price strong');
+        if (price) price.textContent = data.formatted;
         input.value = '';
-        alert(result.data.message || PCAAdmin.labels.saved);
+
+        apply.dataset.oldHtml = '<span>✓</span> ذخیره شد';
+        apply.innerHTML = apply.dataset.oldHtml;
+        setTimeout(() => {
+          apply.dataset.oldHtml = 'اعمال قیمت';
+          apply.innerHTML = 'اعمال قیمت';
+        }, 1800);
       } catch (err) {
         alert(err.message);
       } finally {
