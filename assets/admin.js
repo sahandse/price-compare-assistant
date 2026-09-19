@@ -242,4 +242,52 @@ document.addEventListener('DOMContentLoaded', () => {
       }
     }
   });
+
+  document.addEventListener('click', async e => {
+    const sourceBtn=e.target.closest('.pca-content-source');
+    if(sourceBtn){
+      e.preventDefault();
+      if(sourceBtn.disabled) return;
+      const card=sourceBtn.closest('.pca-content-card');
+      const preview=card.querySelector('.pca-content-preview');
+      const actions=card.querySelector('.pca-content-actions');
+      card.dataset.source=sourceBtn.dataset.source;
+      sourceBtn.disabled=true;
+      preview.innerHTML='<p><span class="pca-spinner"></span> در حال دریافت محتوا…</p>';
+      try{
+        const data=await ajax('pca_fetch_content',{product_id:card.dataset.product,source:sourceBtn.dataset.source});
+        const x=data.content||{};
+        const tags=(x.keywords||[]).map(t=>'<span>'+escapeHtml(t)+'</span>').join('');
+        preview.innerHTML=
+          '<div class="pca-content-field"><small>عنوان منبع</small><strong>'+escapeHtml(x.title||'—')+'</strong></div>'+
+          '<div class="pca-content-field"><small>توضیحات</small><p>'+escapeHtml(x.description||'—')+'</p></div>'+
+          '<div class="pca-content-tags"><small>کلیدواژه‌ها / برچسب‌ها</small><div>'+ (tags||'<em>ندارد</em>') +'</div></div>'+
+          '<a class="pca-source-link" target="_blank" rel="noopener" href="'+escapeHtml(data.url||'#')+'">مشاهده محصول منبع</a>';
+        actions.hidden=false;
+        card.querySelectorAll('.pca-content-source').forEach(b=>b.classList.toggle('is-active',b===sourceBtn));
+      }catch(err){
+        preview.innerHTML='<p class="pca-suggest-error">'+escapeHtml(err.message)+'</p>';
+      }finally{sourceBtn.disabled=false;}
+      return;
+    }
+
+    const applyContent=e.target.closest('.pca-content-apply');
+    if(applyContent){
+      e.preventDefault();
+      const card=applyContent.closest('.pca-content-card');
+      if(!card.dataset.source) return;
+      if(applyContent.dataset.replace==='1' && !confirm('اطلاعات فعلی محصول با محتوای منبع جایگزین شود؟')) return;
+      setBusy(applyContent,true,'در حال اعمال');
+      try{
+        const data=await ajax('pca_apply_content',{
+          product_id:card.dataset.product,
+          source:card.dataset.source,
+          replace:applyContent.dataset.replace
+        });
+        alert(data.message);
+      }catch(err){alert(err.message);}
+      finally{setBusy(applyContent,false);}
+    }
+  });
+
 });
